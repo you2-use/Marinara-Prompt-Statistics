@@ -1,4 +1,4 @@
-/* 프롬프트 통계 1.0.0 — full-page compatibility adapter for Marinara 2.5.2 */
+/* 프롬프트 통계 1.0.2 — full-page compatibility adapter for Marinara 2.5.2 */
 const categories = [
   "프리셋",
   "사용자 지침",
@@ -209,8 +209,44 @@ function hasContent(text) {
       .length > 0
   );
 }
-function partition(messages) {
-  const spans = [];
+// These are Engine-owned Conversation wrappers, not editable preset sections.
+const conversationSections = new Map([
+  ["instructions", 0],
+  ["important_memories", 5],
+  ["summary", 5],
+  ["memories", 5],
+  ["connected_roleplay", 5],
+  ["connected_game", 5],
+  ["lore", 4],
+  ["context", 7],
+  ["commands", 7],
+  ["output_format", 7],
+  ["connected_roleplay_instructions", 7],
+  ["connected_game_instructions", 7],
+]);
+const conversationProfileFields = new Set([
+  "description",
+  "personality",
+  "backstory",
+  "appearance",
+  "scenario",
+  "example_dialogue",
+  "system_prompt",
+  "rpg_attributes",
+]);
+function conversationCategory(label) {
+  const name = normalizedLabel(label).replaceAll(" ", "_");
+  if (/^summary(?:_\(|$)/.test(name)) return 5;
+  if (conversationSections.has(name)) return conversationSections.get(name);
+  const cat = infer(label);
+  return cat >= 1 && cat <= 6 ? cat : 7;
+}
+function partition(messages, chatMode) {
+  const conversation = chatMode === "conversation";
+  const spans = [],
+    profiles = [];
+  let profileBoundary = 0,
+    instructionsSeen = false;
   let history = false;
   messages.forEach((m, mi) => {
     function add(start, end, label, cat, path = [label], basis) {
@@ -252,7 +288,11 @@ function partition(messages) {
           continue;
         }
         if (fence) continue;
-        const tag = line.match(/^<(\/?)([\p{L}_][\p{L}\p{N}_-]*)>$/u);
+        const tag = conversation
+          ? line.match(
+              /^<(\/?)([\p{L}\p{N}_][\p{L}\p{M}\p{N}_-]*|)(?:[ \t]+[\w:-]+=(?:"[^"\r\n]*"|'[^'\r\n]*'))*[ \t]*>$/u,
+            )
+          : line.match(/^<(\/?)([\p{L}_][\p{L}\p{N}_-]*)>$/u);
         if (!tag) continue;
         if (!tag[1]) {
           const node = {
@@ -280,7 +320,80 @@ function partition(messages) {
           n.end === undefined ? paired(n.children) : [n],
         );
       }
+      if (conversation) {
+        const nodes = paired(root.children);
+        const chatRole = m.role === "user" || m.role === "assistant";
+        // Only a contiguous suffix of known Engine injections is split from a
+        // user turn. Ordinary chat (including arbitrary tag examples) stays chat.
+        let suffix = end;
+        if (m.role === "user") {
+          for (let i = nodes.length - 1; i >= 0; i--) {
+            const node = nodes[i];
+            if (
+              !conversationSections.has(node.label) ||
+              node.label === "instructions" ||
+              m.content.slice(node.end, suffix).trim()
+            )
+              break;
+            suffix = node.start;
+          }
+        }
+        let at = start;
+        for (const node of nodes) {
+          if (chatRole)
+            add(at, node.start, m.role, 6, [m.role], "conversation");
+          else plain(at, node.start);
+          let cat = chatRole ? 6 : conversationCategory(node.label);
+          if (m.role === "user" && node.start >= suffix)
+            cat = conversationSections.get(node.label);
+          if (!chatRole) {
+            if (node.label === "instructions") instructionsSeen = true;
+            if (node.label === "summary" || node.label === "lore")
+              profileBoundary++;
+          }
+          const label = node.label || "profile";
+          add(
+            node.start,
+            node.end,
+            label,
+            cat,
+            [label],
+            cat === 7 && !conversationSections.has(node.label)
+              ? "unknown"
+              : "conversation",
+          );
+          const fields = paired(node.children);
+          if (
+            !chatRole &&
+            instructionsSeen &&
+            cat === 7 &&
+            !conversationSections.has(node.label) &&
+            fields.length &&
+            fields.every((field) => conversationProfileFields.has(field.label))
+          )
+            profiles.push({
+              span: spans.at(-1),
+              boundary: profileBoundary,
+            });
+          at = node.end;
+        }
+        if (chatRole) add(at, end, m.role, 6, [m.role], "conversation");
+        else plain(at, end);
+        return;
+      }
       function visit(node, parents = [], inherited = 7) {
+        if (conversation) {
+          const cat = conversationCategory(node.label);
+          add(
+            node.start,
+            node.end,
+            node.label,
+            cat,
+            [...parents, node.label],
+            cat === 7 ? "unknown" : "conversation",
+          );
+          return;
+        }
         const cat = infer(node.label),
           children = paired(node.children);
         const path = [...parents, node.label];
@@ -369,6 +482,13 @@ function partition(messages) {
       }
       plain(at, end);
     }
+    if (conversation) {
+      // Assistant messages cannot contain Engine's user-tail injections.
+      if (m.role === "assistant")
+        add(0, m.content.length, m.role, 6, [m.role], "conversation");
+      else parse(0, m.content.length);
+      return;
+    }
     // Engine history wrappers span messages. Content inside is opaque to the
     // classifier; arbitrary names such as story_development are not aliases.
     let at = 0,
@@ -428,6 +548,22 @@ function partition(messages) {
     if (history) add(at, m.content.length, "chat_history", 6);
     else parse(at, m.content.length);
   });
+  // Engine places fallback characters near Instructions and the persona after
+  // summary/lore, before recent chat. Require profiles on both sides; a single
+  // profile or several candidates on the persona side is ambiguous.
+  const before = profiles.filter((p) => p.boundary === 0);
+  const after = profiles.filter((p) => p.boundary > 0);
+  if (before.length && after.length === 1) {
+    for (const { span } of before) {
+      span.cat = 2;
+      span.basis = "conversation";
+      span.key = JSON.stringify(["conversation", span.role, 2, span.path]);
+    }
+    const { span } = after[0];
+    span.cat = 3;
+    span.basis = "conversation";
+    span.key = JSON.stringify(["conversation", span.role, 3, span.path]);
+  }
   return spans;
 }
 function ruleCategory(span, rules, chat) {
@@ -984,28 +1120,24 @@ const weight = (text) => {
   let n = 0;
   for (const ch of text) {
     const c = ch.codePointAt(0);
-    const inRange = (a, b) => c >= a && c <= b;
-    n += [
-      [0x1100, 0x11ff],
-      [0x3130, 0x318f],
-      [0xa960, 0xa97f],
-      [0xac00, 0xd7af],
-      [0xd7b0, 0xd7ff],
-    ].some(([a, b]) => inRange(a, b))
-      ? 50
-      : [
-            [0x3400, 0x4dbf],
-            [0x4e00, 0x9fff],
-            [0xf900, 0xfaff],
-            [0x20000, 0x323af],
-            [0x3040, 0x309f],
-            [0x30a0, 0x30ff],
-            [0x31f0, 0x31ff],
-            [0xff66, 0xff9f],
-            [0x1b000, 0x1b16f],
-          ].some(([a, b]) => inRange(a, b))
-        ? 67
-        : 25;
+    n +=
+      (c >= 0x1100 && c <= 0x11ff) ||
+      (c >= 0x3130 && c <= 0x318f) ||
+      (c >= 0xa960 && c <= 0xa97f) ||
+      (c >= 0xac00 && c <= 0xd7af) ||
+      (c >= 0xd7b0 && c <= 0xd7ff)
+        ? 50
+        : (c >= 0x3400 && c <= 0x4dbf) ||
+            (c >= 0x4e00 && c <= 0x9fff) ||
+            (c >= 0xf900 && c <= 0xfaff) ||
+            (c >= 0x20000 && c <= 0x323af) ||
+            (c >= 0x3040 && c <= 0x309f) ||
+            (c >= 0x30a0 && c <= 0x30ff) ||
+            (c >= 0x31f0 && c <= 0x31ff) ||
+            (c >= 0xff66 && c <= 0xff9f) ||
+            (c >= 0x1b000 && c <= 0x1b16f)
+          ? 67
+          : 25;
   }
   return n;
 };
@@ -1148,7 +1280,9 @@ function mount(dialog, snapshot) {
   const root = element("section");
   root.dataset.promptStatsRoot = "";
   const hidden = children.slice(1).map((n) => [n, n.hidden]);
-  const baseSpans = partition(snapshot.data.messages);
+  const baseSpans =
+    snapshot.baseSpans ??
+    partition(snapshot.data.messages, snapshot.data.chatMode);
   let spans = applyReferences(
     baseSpans,
     snapshot.references?.matches ?? [],
@@ -1625,14 +1759,22 @@ function mount(dialog, snapshot) {
           ? tr("수동 지정", "Manual")
           : rule !== null
             ? tr("저장 규칙", "Saved rule")
-            : s.basis === "reference"
-              ? tr("현재 자료 원문과 일치", "Matches current source text")
-              : s.basis === "unknown"
-                ? tr(
-                    "분류 미확정 · 혼합 내용일 수 있음",
-                    "Unclassified · may contain mixed sources",
-                  )
-                : tr("태그·제목 기준 추정", "Estimated from tags or headings");
+            : s.basis === "conversation"
+              ? tr(
+                  "콘보방 구조 기준 추정",
+                  "Estimated from Conversation structure",
+                )
+              : s.basis === "reference"
+                ? tr("현재 자료 원문과 일치", "Matches current source text")
+                : s.basis === "unknown"
+                  ? tr(
+                      "분류 미확정 · 혼합 내용일 수 있음",
+                      "Unclassified · may contain mixed sources",
+                    )
+                  : tr(
+                      "태그·제목 기준 추정",
+                      "Estimated from tags or headings",
+                    );
         const detail = element(
           "p",
           `${s.role} · ${s.path.join(" / ")} · ${basis}${s.split ? tr(" · 나눈 구간", " · Split passage") : ""}`,
@@ -1738,23 +1880,26 @@ async function boundedJSON(response, budget) {
   }
 }
 function wrappedFetch(...args) {
+  if (!alive) return Reflect.apply(originalFetch, this, args);
   let match = null,
     body = null;
   try {
     const input = args[0],
       init = args[1];
-    const url = new URL(
-      input instanceof Request ? input.url : input,
-      location.href,
-    );
     const method = (
       init?.method || (input instanceof Request ? input.method : "GET")
     ).toUpperCase();
-    if (alive && url.origin === location.origin && method === "POST")
-      match = url.pathname.match(/^\/api\/chats\/([^/]+)\/peek-prompt$/);
-    body = init?.body;
-    if (match && input instanceof Request && body === undefined)
-      body = boundedJSON(input.clone()).catch(() => ({}));
+    if (method === "POST") {
+      const url = new URL(
+        input instanceof Request ? input.url : input,
+        location.href,
+      );
+      if (url.origin === location.origin)
+        match = url.pathname.match(/^\/api\/chats\/([^/]+)\/peek-prompt$/);
+      body = init?.body;
+      if (match && input instanceof Request && body === undefined)
+        body = boundedJSON(input.clone()).catch(() => ({}));
+    }
   } catch {}
   if (!match) return Reflect.apply(originalFetch, this, args);
   if (active && !active.dialog.isConnected) restore();
@@ -1795,14 +1940,19 @@ function wrappedFetch(...args) {
                 request.messageId = parsed.messageId;
             } catch {}
             if (!alive || seq !== sequence) return;
+            // Reuse the parse needed to decide whether source matching is useful.
+            const baseSpans =
+              data.chatMode === "roleplay" &&
+              typeof marinara.fetch === "function"
+                ? partition(data.messages)
+                : null;
             const snapshot = {
               chat,
               data,
               before,
+              baseSpans,
               loading:
-                data.chatMode === "roleplay" &&
-                typeof marinara.fetch === "function" &&
-                partition(data.messages).some((s) => s.cat === 7 && s.visible),
+                baseSpans?.some((s) => s.cat === 7 && s.visible) ?? false,
             };
             pending = snapshot;
             attach();
@@ -1888,8 +2038,17 @@ function observeDialog() {
 }
 window.fetch = wrappedFetch;
 const observer = new MutationObserver((records) => {
+  if (active) {
+    if (!active.dialog.isConnected) attach();
+    else if (
+      records.some((record) =>
+        [...record.removedNodes].some((node) => node.contains(active.dialog)),
+      )
+    )
+      observeDialog();
+    return;
+  }
   if (
-    active ||
     records.some(
       (record) =>
         record.target.closest?.("[data-chat-floating-panel]") ||
