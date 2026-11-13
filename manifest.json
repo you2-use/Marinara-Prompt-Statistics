@@ -1,0 +1,13 @@
+{
+  "kind": "marinara.personal-extension",
+  "version": 1,
+  "config": {
+    "name": "프롬프트 통계",
+    "version": "1.0.0",
+    "description": "프롬프트 구성, 토큰 통계, 원문을 확인합니다.",
+    "runtime": "client",
+    "capabilities": ["full_page_access"],
+    "jsPath": "extension.js",
+    "cssPath": "extension.css"
+  }
+}
