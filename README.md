@@ -21,7 +21,8 @@ Marinara의 **프롬프트 구성** 창에서 요청의 원문과 토큰 통계�
 
 ## ZIP으로 직접 설치
 
-1. [v1.0.0 설치용 ZIP 다운로드](https://github.com/you2-use/Marinara-Prompt-Statistics/releases/download/v1.0.0/Prompt-Statistics.personal-extension.zip)
+1. [v1.0.2 설치용 ZIP 다운로드](https://github.com/you2-use/Marinara-Prompt-Statistics/releases/download/v1.0.2/Prompt-Statistics.personal-extension.zip)
+
 2. **설정 → Addons → External Extensions → 확장 파일 가져오기(Import Extension File)**에서 다운로드한 ZIP을 선택하세요. 압축을 풀 필요 없이 ZIP 그대로 가져옵니다.
 3. 확장의 코드와 **전체 페이지 접근** 권한을 검토한 뒤 **검토 및 실행(Review and Run)**을 누르세요.
 
